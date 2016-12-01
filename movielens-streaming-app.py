@@ -1,6 +1,6 @@
 from __future__ import print_function
 import sys
-from pyspark import SparkContext
+from pyspark import SparkContext, SparkConf
 from pyspark.streaming import StreamingContext
 from pyspark.sql import SQLContext, Row
 from pyspark.streaming.kafka import KafkaUtils
@@ -12,7 +12,6 @@ from operator import add
 from math import sqrt
 
 checkpointDirectory = "./checkpoint/spark-streaming-consumer"
-# Function to create and setup a new StreamingContext
 
 def parseMovie(line):
     """
@@ -20,104 +19,121 @@ def parseMovie(line):
     """
     fields = line.strip().split("\t")
     return int(fields[0]), fields[1]
+
+def modelPredict(rdd):
+    """
+    Return model predctions
+    """ 
+    predictions = model.predictAll(rdd.map(lambda x: (int(x[1]), int(x[2])))).map(lambda r: ((r[0], r[1]), round(r[2],1)))
+    return predictions.join(rdd.map(lambda x: ((int(x[1]), int(x[2])), (float(x[3]), x[0]))))  
     
 def updateRmse(newValue, runningRmse):  
     if runningRmse is None:
         runningRmse = 0
     return sqrt(runningRmse**2 + newValue**2)
 
-# def movieRec(usersRDD):
-#     users = usersRDD.map(lambda x : x[0]).collect()
-#     for user in users:
-#         preds = model.predictAll(movies.map(lambda x: (user, x))).map(lambda r: ('Recommenations', r[0], r[1], r[2])).sortByKey(lambda r: r[2])
-#     return preds
-
-    # users.map(lambda r: (r)).transform(lambda rdd: rdd.rightOuterJoin(movies.map(lambda r: (r[0], r[1]))))
-    # predictions = bestModel.predictAll(candidates.map(lambda x: (0, x))).collect()
-
+def movieRec(rdd):
+    return model.recommendProducts(rdd.map(lambda r : (r[1])),5)
+    # return recommendations
+    # allMovies = movies.map(lambda x: x[0]).collect()
+    # return rdd.map(lambda r: r[0], [m for m in allMovies])
+    # predictions = model.predictAll(allMovies.map(lambda x: (userID, x))).collect()
+    # predictions.map(lambda x: (x[0], x[1]), x[3]).map(lambda r: r.sorted)
+    # return sorted(predictions, key=lambda x: x[2], reverse=True)[:50]
+    
 if __name__ == "__main__":
     if len(sys.argv) != 3:
         print("Usage: sys.argv[0] <zk> <topic>", file=sys.stderr)
         sys.exit(-1)
 
     sc = SparkContext(appName="StreamingKafkaConsumerSaveToElastic")
-    ssc = StreamingContext(sc, 5)
-    # ssc.addStreamingListener(streamingListener)
-    # ssc.checkpoint("./checkpoint/spark-streaming-consumer")   
+    ssc = StreamingContext(sc, 10)
+    # ssc.checkpoint(checkpointDirectory)  # set checkpoint directory
 
     zkQuorum, topic = sys.argv[1:]
 
-    kvs = KafkaUtils.createStream(ssc, zkQuorum, "spark-streaming-consumer", {topic: 1})  
+    kvs = KafkaUtils.createStream(ssc, zkQuorum, "spark-streaming-consumer", {topic: 1})    
     lines = kvs.map(lambda x: x[1])
-    lines.pprint()
-    lines.count().pprint()
-    
-    model = MatrixFactorizationModel.load(sc, "./target/tmp/movieLensRecom")
-    movies = sc.textFile("C:/Users/AJA35/Documents/Data Sandbox/real-time embedded analytics/data/ml-latest-small/movies.txt").map(parseMovie)
-  	
-    ratings = lines.map(lambda line: line.split(","))
-    ratings.cache()
-    # ratings.pprint()
-    
-    predictions = ratings.map(lambda r: (int(r[1]),int(r[2]))).transform(lambda rdd: model.predictAll(rdd)).map(lambda r: (r[0], r[1], round(r[2],1)))
-    # predictions.pprint()
 
-    predsAndRates = predictions.map(lambda x: (str(x[0]) + ',' + str(x[1]), x[2])).join(ratings.map(lambda r: (r[1] + ',' + r[2], (float(r[3]), r[0]))))
-    predsAndRates.pprint()
+    # lines.pprint()
+    lines.count().pprint() 
 
-    # Evaluate predictions
+    if lines.transform(lambda rdd: rdd.first()) :
 
-    rmse = predsAndRates.map(lambda x: (x[1][0] - x[1][1][0]) ** 2) \
-        .reduce(add) \
-        .map(lambda y : ('mse', y)) \
-        .join(predsAndRates.count().map(lambda c : ('mse', c))) \
-        .map(lambda x : sqrt(x[1][0]/x[1][1])) \
-        .map(lambda r : {'RMSE': r})
-    rmse.pprint()
+        global model
+        model = MatrixFactorizationModel.load(sc, "./target/tmp/movieLensRecom")
 
-    # runningRmse = rmse.updateStateByKey(updateRmse)
-    # runningRmse.pprint()  
+        movies = sc.textFile("C:/Users/AJA35/Documents/Data Sandbox/real-time embedded analytics/data/ml-latest-small/movies.txt").map(parseMovie)
+      	
+        ratings = lines.map(lambda line: line.split(","))
+        ratings.cache()
+        ratings.pprint()
 
-    # Writing to ElasticSearch
+        predsAndRates = ratings.transform(lambda rdd: modelPredict(rdd))
+        predsAndRates.pprint()
 
-    predsAndRates_dict = predsAndRates.map(lambda r: (int(r[0].split(",")[1]), (r[0].split(",")[0], r[1][0], r[1][1][0], r[1][1][1]))) \
-        .transform(lambda rdd: rdd.join(movies.map(lambda r: (int(r[0]), r[1])))) \
-        .map(lambda r: {'tstamp': r[1][0][3], 'userID': r[1][0][0], 'movieID': r[0], 'movieTitle': r[1][1], 'predictedRating' : r[1][0][1], 'actualRating': r[1][0][2]})
-    es_predsAndRates = predsAndRates_dict.map(lambda r : ('key', r))
-    es_predsAndRates.pprint()
+        # Root mean sqaured error
+       
+        # rmse = predsAndRates.transform(lambda rdd: computeRmse(rdd)) #.map(lambda r : {'RMSE': r})
+        # rmse = predsAndRates.map(lambda x: (x[1][0] - x[1][1][0]) ** 2) \
+        #     .reduce(add) \
+        #     .map(lambda y : ('mse', y)) \
+        #     .join(predsAndRates.count().map(lambda c : ('mse', c))) \
+        #     .map(lambda x : sqrt(x[1][0]/x[1][1])) \
+        #     .union(predsAndRates.map(lambda r: max(r[1][1][1]))) \
+        #     .map(lambda r : {'tstamp': r[1], 'RMSE': r[0]})
+        # rmse.pprint()
 
-    es_predsAndRates.foreachRDD(lambda rdd: rdd.saveAsNewAPIHadoopFile(path='_',
-          outputFormatClass="org.elasticsearch.hadoop.mr.EsOutputFormat", 
-          keyClass="org.apache.hadoop.io.NullWritable", 
-          valueClass="org.elasticsearch.hadoop.mr.LinkedMapWritable", 
-          conf={"es.resource": "movies/ratingPrediction"}))
+        # # rmseBase = predsAndRates.transform(lambda rdd: baselineRmse(rdd)).map(lambda r : {'RMSE_CLIM': r})
+        # meanRating = predsAndRates.map(lambda r: sum(x[1][1][0])/length(x[1][1][0]))
 
-    es_rmse = rmse.map(lambda r: ('key', r))
-    es_rmse.pprint()
+        # rmseBase = predsAndRates.map(lambda x: (meanRating- x[1][1][0]) ** 2) \
+        #     .reduce(add) \
+        #     .map(lambda y : ('mse', y)) \
+        #     .join(predsAndRates.count().map(lambda c : ('mse', c))) \
+        #     .map(lambda x : sqrt(x[1][0]/x[1][1])) \
+        #     .union(predsAndRates.map(lambda r: max(r[1][1][1]))) \
+        #     .map(lambda r : {'tstamp': r[1], 'RMSE_base': r[0]})
+        # rmseBase.pprint()
 
-    es_rmse.foreachRDD(lambda rdd: rdd.saveAsNewAPIHadoopFile(path='_',
-          outputFormatClass="org.elasticsearch.hadoop.mr.EsOutputFormat", 
-          keyClass="org.apache.hadoop.io.NullWritable", 
-          valueClass="org.elasticsearch.hadoop.mr.LinkedMapWritable", 
-          conf={"es.resource": "movies/rmse"}))
+        # runningRmse = rmse.updateStateByKey(updateRmse)
+        # runningRmse.pprint()  
 
-    # Recommendations - create list to add to 
+        # Writing to ElasticSearch
 
-    # recommendData = ratings.map(lambda r: (r[2],r[1])).transform(lambda rdd: rdd.join(movies.map(lambda r: (r[0], r[1]))))
-    # recommendData.pprint()
+        # predsAndRates_dict = predsAndRates.map(lambda r: (r[0][1], (r[0][0], r[1][0], r[1][1][0], abs(r[1][0] - r[1][1][0]),  r[1][1][1]))) \
+        #     .transform(lambda rdd: rdd.join(movies.map(lambda r: (r[0], r[1])))) \
+        #     .map(lambda r: {'tstamp': r[1][0][4], 'userID': r[1][0][0], 'movieID': r[0], 'movieTitle': r[1][1], 'predictedRating' : r[1][0][1], 'actualRating': r[1][0][2], 'absError': r[1][0][3]})
+        # es_predsAndRates = predsAndRates_dict.map(lambda r : ('key', r))
+        # es_predsAndRates.foreachRDD(lambda rdd: rdd.saveAsNewAPIHadoopFile(path='_',
+        #       outputFormatClass="org.elasticsearch.hadoop.mr.EsOutputFormat", 
+        #       keyClass="org.apache.hadoop.io.NullWritable", 
+        #       valueClass="org.elasticsearch.hadoop.mr.LinkedMapWritable",   
+        #       conf={"es.resource": "movies/ratingPrediction"}))
 
-    # movies.transform(lambda rdd: rdd.map(lambda r: r[0], r[1])).pprint()
-    # recommendData = ratings.map(lambda r: (r[2],r[1])).transform(movieRec) #lambda rdd: rdd.join(movies.map(lambda r: (r[0], r[1]))))
-    # recommendData.pprint()
-	# preds = recommendData.map(lambda r: (r[0], r[1])).transform(lambda rdd: model.predictAll(rdd).map(lambda r: ('Recommendations',r[2]).sortByKey(lambda r: r[2])
+        # es_rmse = rmse.map(lambda r: ('key', r))
+        # es_rmse.foreachRDD(lambda rdd: rdd.saveAsNewAPIHadoopFile(path='_',
+        #       outputFormatClass="org.elasticsearch.hadoop.mr.EsOutputFormat", 
+        #       keyClass="org.apache.hadoop.io.NullWritable", 
+        #       valueClass="org.elasticsearch.hadoop.mr.LinkedMapWritable", 
+        #       conf={"es.resource": "movies/rmse"}))
 
-	# recommendations = sorted(preds, key=lambda x: x[2], reverse=True)[:50]
- #    recommendations = sorted(preds.map(lambda r: ('key',r)), key=lambda x: x[2], reverse=True)[:1]
-   
-    # movies is an RDD of (movieId, movieTitle)
-    # print ("Movies recommended for you:")
-    # for i in xrange(len(recommendations)):
-    # 	print ("%2d: %s" % (i + 1, movies[recommendations[i][1]])).encode('ascii', 'ignore')
+        # es_rmseBase = rmseBase.map(lambda r: ('key', r))
+        # es_rmseBase.foreachRDD(lambda rdd: rdd.saveAsNewAPIHadoopFile(path='_',
+        #       outputFormatClass="org.elasticsearch.hadoop.mr.EsOutputFormat", 
+        #       keyClass="org.apache.hadoop.io.NullWritable", 
+        #       valueClass="org.elasticsearch.hadoop.mr.LinkedMapWritable", 
+        #       conf={"es.resource": "movies/rmseBase"}))
 
-    ssc.start()
-    ssc.awaitTermination()
+        # Recommendations - create list of movies sorted by predicted ratings 
+
+        # update model with each new batch
+        # trainingData = ratings.map(lambda r: (r[1], r[2], r[3])).cache()
+        # model = ALS.train(trainingData)
+
+        # print(model.recommendProductsForUsers(5))
+        recommendations = ratings.transform(lambda rdd: movieRec(rdd)) 
+        recommendations.pprint()
+
+ssc.start()
+ssc.awaitTermination()
