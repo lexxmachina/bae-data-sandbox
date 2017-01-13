@@ -10,6 +10,7 @@ from pyspark.mllib.recommendation import ALS, MatrixFactorizationModel, Rating
 import itertools
 from operator import add
 from math import sqrt
+import numpy as np
 
 checkpointDirectory = "./checkpoint/spark-streaming-consumer"
 
@@ -17,7 +18,7 @@ def parseMovie(line):
     """
     Parses a movie record in MovieLens format movieId::movieTitle .
     """
-    fields = line.strip().split("\t")
+    fields = line.strip().split("::")
     return int(fields[0]), fields[1]
 
 def modelPredict(rdd):
@@ -27,19 +28,28 @@ def modelPredict(rdd):
     predictions = model.predictAll(rdd.map(lambda x: (int(x[1]), int(x[2])))).map(lambda r: ((r[0], r[1]), round(r[2],1)))
     return predictions.join(rdd.map(lambda x: ((int(x[1]), int(x[2])), (float(x[3]), x[0]))))  
     
+def computeRmse(rdd) :
+    arr = rdd.map(lambda x: (x[1][0], x[1][1][0])).collect()
+    se = [(x[0] - x[1])**2 for x in arr]
+    return sc.parallelize([sum(se)/float(len(se))])
+    
 def updateRmse(newValue, runningRmse):  
     if runningRmse is None:
         runningRmse = 0
     return sqrt(runningRmse**2 + newValue**2)
 
 def movieRec(rdd):
-    return model.recommendProducts(rdd.map(lambda r : (r[1])),5)
-    # return recommendations
-    # allMovies = movies.map(lambda x: x[0]).collect()
-    # return rdd.map(lambda r: r[0], [m for m in allMovies])
-    # predictions = model.predictAll(allMovies.map(lambda x: (userID, x))).collect()
-    # predictions.map(lambda x: (x[0], x[1]), x[3]).map(lambda r: r.sorted)
-    # return sorted(predictions, key=lambda x: x[2], reverse=True)[:50]
+    users = rdd.map(lambda r: int(r[1])).collect()
+    moviesList = movies.collect()
+    recommendations = []
+    for user in users:
+        recs = model.recommendProducts(user,5)
+        recTitle = []
+        for rec in recs:
+            ind = [y[0] for y in moviesList].index(rec.product)
+            recTitle.append(rec + (moviesList[ind][1],))
+        recommendations.append(recTitle)
+    return sc.parallelize([item for item in recommendations])
     
 if __name__ == "__main__":
     if len(sys.argv) != 3:
@@ -60,10 +70,9 @@ if __name__ == "__main__":
 
     if lines.transform(lambda rdd: rdd.first()) :
 
-        global model
         model = MatrixFactorizationModel.load(sc, "./target/tmp/movieLensRecom")
 
-        movies = sc.textFile("C:/Users/AJA35/Documents/Data Sandbox/real-time embedded analytics/data/ml-latest-small/movies.txt").map(parseMovie)
+        movies = sc.textFile("C:/Users/AJA35/Documents/Data Sandbox/real-time embedded analytics/data/ml-1m/movies.dat").map(parseMovie)
       	
         ratings = lines.map(lambda line: line.split(","))
         ratings.cache()
@@ -72,19 +81,23 @@ if __name__ == "__main__":
         predsAndRates = ratings.transform(lambda rdd: modelPredict(rdd))
         predsAndRates.pprint()
 
-        # Root mean sqaured error
-       
-        # rmse = predsAndRates.transform(lambda rdd: computeRmse(rdd)) #.map(lambda r : {'RMSE': r})
+        predsAndRates_dict = predsAndRates.map(lambda r: (r[0][1], (r[0][0], r[1][0], r[1][1][0], abs(r[1][0] - r[1][1][0]),  r[1][1][1]))) \
+            .transform(lambda rdd: rdd.join(movies.map(lambda r: (r[0], r[1])))) \
+            .map(lambda r: {'tstamp': r[1][0][4], 'userID': r[1][0][0], 'movieID': r[0], 'movieTitle': r[1][1], 'predictedRating' : r[1][0][1], 'actualRating': r[1][0][2], 'absError': r[1][0][3]})
+        predsAndRates_dict.pprint()
+
+    # Root mean sqaured error
+        rmse = predsAndRates.transform(lambda rdd: computeRmse(rdd)).map(lambda r : {'RMSE': r})
         # rmse = predsAndRates.map(lambda x: (x[1][0] - x[1][1][0]) ** 2) \
         #     .reduce(add) \
         #     .map(lambda y : ('mse', y)) \
         #     .join(predsAndRates.count().map(lambda c : ('mse', c))) \
-        #     .map(lambda x : sqrt(x[1][0]/x[1][1])) \
-        #     .union(predsAndRates.map(lambda r: max(r[1][1][1]))) \
-        #     .map(lambda r : {'tstamp': r[1], 'RMSE': r[0]})
-        # rmse.pprint()
+        #     .map(lambda x : sqrt(x[1][0]/x[1][1]))  \
+        #     .map(lambda r : {'RMSE': r})
+        rmse.pprint()
 
-        # # rmseBase = predsAndRates.transform(lambda rdd: baselineRmse(rdd)).map(lambda r : {'RMSE_CLIM': r})
+        # BASELINE RMSE could be broadcast variable (i.e. persisted on nodes)
+        rmseBase = predsAndRates.transform(lambda rdd: baselineRmse(rdd)).map(lambda r : {'RMSE_Base': r})
         # meanRating = predsAndRates.map(lambda r: sum(x[1][1][0])/length(x[1][1][0]))
 
         # rmseBase = predsAndRates.map(lambda x: (meanRating- x[1][1][0]) ** 2) \
@@ -92,31 +105,40 @@ if __name__ == "__main__":
         #     .map(lambda y : ('mse', y)) \
         #     .join(predsAndRates.count().map(lambda c : ('mse', c))) \
         #     .map(lambda x : sqrt(x[1][0]/x[1][1])) \
-        #     .union(predsAndRates.map(lambda r: max(r[1][1][1]))) \
-        #     .map(lambda r : {'tstamp': r[1], 'RMSE_base': r[0]})
+        #     .map(lambda r : {'RMSE_base': r})
         # rmseBase.pprint()
 
         # runningRmse = rmse.updateStateByKey(updateRmse)
         # runningRmse.pprint()  
 
-        # Writing to ElasticSearch
+    # Recommendations - create list of movies sorted by predicted ratings 
 
-        # predsAndRates_dict = predsAndRates.map(lambda r: (r[0][1], (r[0][0], r[1][0], r[1][1][0], abs(r[1][0] - r[1][1][0]),  r[1][1][1]))) \
-        #     .transform(lambda rdd: rdd.join(movies.map(lambda r: (r[0], r[1])))) \
-        #     .map(lambda r: {'tstamp': r[1][0][4], 'userID': r[1][0][0], 'movieID': r[0], 'movieTitle': r[1][1], 'predictedRating' : r[1][0][1], 'actualRating': r[1][0][2], 'absError': r[1][0][3]})
-        # es_predsAndRates = predsAndRates_dict.map(lambda r : ('key', r))
-        # es_predsAndRates.foreachRDD(lambda rdd: rdd.saveAsNewAPIHadoopFile(path='_',
-        #       outputFormatClass="org.elasticsearch.hadoop.mr.EsOutputFormat", 
-        #       keyClass="org.apache.hadoop.io.NullWritable", 
-        #       valueClass="org.elasticsearch.hadoop.mr.LinkedMapWritable",   
-        #       conf={"es.resource": "movies/ratingPrediction"}))
+        recommendations = ratings.transform(lambda rdd: movieRec(rdd)) \
+            .map(lambda r: (r[0][0], str([(r[0][1], r[0][3], r[0][2]), (r[1][1], r[1][3], r[1][2]), (r[2][1], r[2][3], r[2][2]), (r[3][1], r[3][3], r[3][2]), (r[4][1], r[4][3], r[4][2])]))) \
+            .join(ratings.map(lambda r: (int(r[1]), r[0]))) \
+            .map(lambda r: {'tstamp': r[1][1], 'user': r[0], 'top5recommendations': r[1][0]})
+        recommendations.pprint()
 
-        # es_rmse = rmse.map(lambda r: ('key', r))
-        # es_rmse.foreachRDD(lambda rdd: rdd.saveAsNewAPIHadoopFile(path='_',
-        #       outputFormatClass="org.elasticsearch.hadoop.mr.EsOutputFormat", 
-        #       keyClass="org.apache.hadoop.io.NullWritable", 
-        #       valueClass="org.elasticsearch.hadoop.mr.LinkedMapWritable", 
-        #       conf={"es.resource": "movies/rmse"}))
+        # update model with each new batch
+
+        # trainingData = ratings.map(lambda r: (r[1], r[2], r[3])).cache()
+        # model = ALS.train(trainingData)
+
+    # Writing to ElasticSearch
+
+        es_predsAndRates = predsAndRates_dict.map(lambda r : ('key', r))
+        es_predsAndRates.foreachRDD(lambda rdd: rdd.saveAsNewAPIHadoopFile(path='_',
+              outputFormatClass="org.elasticsearch.hadoop.mr.EsOutputFormat", 
+              keyClass="org.apache.hadoop.io.NullWritable", 
+              valueClass="org.elasticsearch.hadoop.mr.LinkedMapWritable",   
+              conf={"es.resource": "movies/ratingPrediction"}))
+
+        es_rmse = rmse.map(lambda r: ('key', r))
+        es_rmse.foreachRDD(lambda rdd: rdd.saveAsNewAPIHadoopFile(path='_',
+              outputFormatClass="org.elasticsearch.hadoop.mr.EsOutputFormat", 
+              keyClass="org.apache.hadoop.io.NullWritable", 
+              valueClass="org.elasticsearch.hadoop.mr.LinkedMapWritable", 
+              conf={"es.resource": "movies/rmse"}))
 
         # es_rmseBase = rmseBase.map(lambda r: ('key', r))
         # es_rmseBase.foreachRDD(lambda rdd: rdd.saveAsNewAPIHadoopFile(path='_',
@@ -125,15 +147,12 @@ if __name__ == "__main__":
         #       valueClass="org.elasticsearch.hadoop.mr.LinkedMapWritable", 
         #       conf={"es.resource": "movies/rmseBase"}))
 
-        # Recommendations - create list of movies sorted by predicted ratings 
-
-        # update model with each new batch
-        # trainingData = ratings.map(lambda r: (r[1], r[2], r[3])).cache()
-        # model = ALS.train(trainingData)
-
-        # print(model.recommendProductsForUsers(5))
-        recommendations = ratings.transform(lambda rdd: movieRec(rdd)) 
-        recommendations.pprint()
+        es_recommendations = recommendations.map(lambda r: ('key', r))
+        es_recommendations.foreachRDD(lambda rdd: rdd.saveAsNewAPIHadoopFile(path='_',
+            outputFormatClass="org.elasticsearch.hadoop.mr.EsOutputFormat", 
+            keyClass="org.apache.hadoop.io.NullWritable", 
+            valueClass="org.elasticsearch.hadoop.mr.LinkedMapWritable",   
+            conf={"es.resource": "movies/recommendations"}))      
 
 ssc.start()
 ssc.awaitTermination()
